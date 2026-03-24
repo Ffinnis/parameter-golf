@@ -85,6 +85,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    teon_enabled = bool(int(os.environ.get("TEON_ENABLED", "0")))
+    teon_k = int(os.environ.get("TEON_K", 2))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -110,11 +112,24 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, teon_pairs=None):
+        self.teon_pairs = teon_pairs or []
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
+
+    def _momentum_and_nesterov(self, p, momentum, nesterov):
+        """Compute momentum buffer update and return the (possibly Nesterov-corrected) gradient."""
+        g = p.grad
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+        buf = state["momentum_buffer"]
+        buf.mul_(momentum).add_(g)
+        if nesterov:
+            g = g.add(buf, alpha=momentum)
+        return g
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -139,31 +154,56 @@ class Muon(torch.optim.Optimizer):
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
-            curr = 0
+            # Precompute cumulative offsets for each param
+            offsets = [0]
+            for p in params:
+                offsets.append(offsets[-1] + int(p.numel()))
+
+            # Build set of indices handled by TEON pairs
+            teon_indices = set()
+            for pair in self.teon_pairs:
+                for idx in pair:
+                    teon_indices.add(idx)
+
+            # Phase 1: TEON pairs (pair-level round-robin)
+            for pair_idx, pair in enumerate(self.teon_pairs):
+                if pair_idx % world_size != rank:
+                    continue
+                # Pre-check all grads before advancing any momentum buffer
+                if any(params[idx].grad is None for idx in pair):
+                    continue
+                grads = [self._momentum_and_nesterov(params[idx], momentum, nesterov) for idx in pair]
+                # Mode-1 matricization: concatenate along columns
+                stacked = torch.cat(grads, dim=1)
+                stacked = zeropower_via_newtonschulz5(stacked, steps=backend_steps)
+                # Split back and apply per-layer scale correction
+                col = 0
+                for idx, g in zip(pair, grads):
+                    p = params[idx]
+                    n_cols = g.size(1)
+                    g_slice = stacked[:, col : col + n_cols]
+                    g_slice = g_slice * max(1, p.size(0) / p.size(1)) ** 0.5
+                    updates_flat[offsets[idx] : offsets[idx + 1]] = g_slice.reshape(-1)
+                    col += n_cols
+
+            # Phase 2: non-TEON params (element-level round-robin)
+            non_teon_i = 0
             for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
+                if i in teon_indices:
+                    continue
+                if non_teon_i % world_size == rank and p.grad is not None:
+                    g = self._momentum_and_nesterov(p, momentum, nesterov)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+                    updates_flat[offsets[i] : offsets[i + 1]] = g.reshape(-1)
+                non_teon_i += 1
 
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+            for i, p in enumerate(params):
+                g = updates_flat[offsets[i] : offsets[i + 1]].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
-                curr += p.numel()
 
         return loss
 
@@ -868,11 +908,37 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    # Build TEON pairs: stack QKV gradients from consecutive block pairs
+    teon_pairs = []
+    if args.teon_enabled:
+        matrix_param_names = [
+            name for name, p in block_named_params
+            if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        qkv_by_block = {}
+        for idx, name in enumerate(matrix_param_names):
+            for proj in ("c_q", "c_k", "c_v"):
+                if f".attn.{proj}." in name:
+                    block_idx = int(name.split(".")[0])
+                    qkv_by_block.setdefault(block_idx, {})[proj] = idx
+                    break
+        # Pair consecutive blocks within encoder and decoder halves
+        enc = list(range(base_model.num_encoder_layers))
+        dec = list(range(base_model.num_encoder_layers, args.num_layers))
+        for segment in (enc, dec):
+            for start in range(0, len(segment) - args.teon_k + 1, args.teon_k):
+                group = segment[start : start + args.teon_k]
+                if all(b in qkv_by_block and len(qkv_by_block[b]) == 3 for b in group):
+                    for proj in ("c_q", "c_k", "c_v"):
+                        teon_pairs.append(tuple(qkv_by_block[b][proj] for b in group))
+        if rank == 0:
+            print(f"TEON enabled: {len(teon_pairs)} pairs (K={args.teon_k})")
     optimizer_muon = Muon(
         matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        teon_pairs=teon_pairs,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
