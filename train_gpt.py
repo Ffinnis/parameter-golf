@@ -114,22 +114,34 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, teon_pairs=None):
         self.teon_pairs = teon_pairs or []
+        self._cache = None
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
 
-    def _momentum_and_nesterov(self, p, momentum, nesterov):
-        """Compute momentum buffer update and return the (possibly Nesterov-corrected) gradient."""
-        g = p.grad
-        state = self.state[p]
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros_like(g)
-        buf = state["momentum_buffer"]
-        buf.mul_(momentum).add_(g)
-        if nesterov:
-            g = g.add(buf, alpha=momentum)
-        return g
+    def _build_cache(self, params):
+        offsets = [0]
+        for p in params:
+            offsets.append(offsets[-1] + int(p.numel()))
+        teon_indices = set()
+        teon_bufs = []
+        teon_col_splits = []
+        teon_scales = []
+        for pair in self.teon_pairs:
+            for idx in pair:
+                teon_indices.add(idx)
+            rows = params[pair[0]].size(0)
+            cols = [params[idx].size(1) for idx in pair]
+            teon_bufs.append(torch.zeros(rows, sum(cols), device=params[0].device))
+            teon_col_splits.append(cols)
+            teon_scales.append([max(1, params[idx].size(0) / params[idx].size(1)) ** 0.5 for idx in pair])
+        # Pre-compute non-TEON scale corrections
+        non_teon_scales = {}
+        for i, p in enumerate(params):
+            if i not in teon_indices:
+                non_teon_scales[i] = max(1, p.size(0) / p.size(1)) ** 0.5
+        return offsets, teon_indices, teon_bufs, teon_col_splits, teon_scales, non_teon_scales
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -151,40 +163,44 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            if self._cache is None:
+                self._cache = self._build_cache(params)
+            offsets, teon_indices, teon_bufs, teon_col_splits, teon_scales, non_teon_scales = self._cache
 
-            # Precompute cumulative offsets for each param
-            offsets = [0]
-            for p in params:
-                offsets.append(offsets[-1] + int(p.numel()))
-
-            # Build set of indices handled by TEON pairs
-            teon_indices = set()
-            for pair in self.teon_pairs:
-                for idx in pair:
-                    teon_indices.add(idx)
+            updates_flat = torch.zeros(offsets[-1], device=params[0].device, dtype=torch.bfloat16)
 
             # Phase 1: TEON pairs (pair-level round-robin)
             for pair_idx, pair in enumerate(self.teon_pairs):
                 if pair_idx % world_size != rank:
                     continue
-                # Pre-check all grads before advancing any momentum buffer
                 if any(params[idx].grad is None for idx in pair):
                     continue
-                grads = [self._momentum_and_nesterov(params[idx], momentum, nesterov) for idx in pair]
-                # Mode-1 matricization: concatenate along columns
-                stacked = torch.cat(grads, dim=1)
-                stacked = zeropower_via_newtonschulz5(stacked, steps=backend_steps)
-                # Split back and apply per-layer scale correction
+                stacked = teon_bufs[pair_idx]
+                col_splits = teon_col_splits[pair_idx]
+                scales = teon_scales[pair_idx]
+                # Write momentum+nesterov directly into pre-allocated stacked buffer
                 col = 0
-                for idx, g in zip(pair, grads):
+                for idx, ncols in zip(pair, col_splits):
                     p = params[idx]
-                    n_cols = g.size(1)
-                    g_slice = stacked[:, col : col + n_cols]
-                    g_slice = g_slice * max(1, p.size(0) / p.size(1)) ** 0.5
-                    updates_flat[offsets[idx] : offsets[idx + 1]] = g_slice.reshape(-1)
-                    col += n_cols
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        torch.add(g, buf, alpha=momentum, out=stacked[:, col : col + ncols])
+                    else:
+                        stacked[:, col : col + ncols].copy_(buf)
+                    col += ncols
+                orth = zeropower_via_newtonschulz5(stacked, steps=backend_steps)
+                col = 0
+                for idx, ncols, scale in zip(pair, col_splits, scales):
+                    sl = orth[:, col : col + ncols]
+                    if scale != 1.0:
+                        sl = sl * scale
+                    updates_flat[offsets[idx] : offsets[idx + 1]] = sl.reshape(-1)
+                    col += ncols
 
             # Phase 2: non-TEON params (element-level round-robin)
             non_teon_i = 0
@@ -192,9 +208,16 @@ class Muon(torch.optim.Optimizer):
                 if i in teon_indices:
                     continue
                 if non_teon_i % world_size == rank and p.grad is not None:
-                    g = self._momentum_and_nesterov(p, momentum, nesterov)
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    g *= non_teon_scales[i]
                     updates_flat[offsets[i] : offsets[i + 1]] = g.reshape(-1)
                 non_teon_i += 1
 
